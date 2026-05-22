@@ -1,0 +1,283 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  API Management Policies for 3rd Party Logistics API
+  Applies to: POST /logistics/shipments
+-->
+<policies>
+    
+    <!-- ═══════════════════════════════════════════════════════════════════════════════════════════ -->
+    <!-- INBOUND POLICIES (Before forwarding to backend)                                            -->
+    <!-- ═══════════════════════════════════════════════════════════════════════════════════════════ -->
+    <inbound>
+        <base />
+        
+        <!-- ────────────────────────────────────────────────────────────────────────────────────── -->
+        <!-- 1. RATE LIMITING                                                                       -->
+        <!-- ────────────────────────────────────────────────────────────────────────────────────── -->
+        <!-- Protect 3rd party API from being overwhelmed -->
+        <rate-limit-by-key 
+            calls="100" 
+            renewal-period="60" 
+            counter-key="@(context.Subscription.Id)" />
+        
+        <!-- Alternative: Rate limit per correlation ID (per shipment) -->
+        <!--
+        <rate-limit-by-key 
+            calls="5" 
+            renewal-period="60" 
+            counter-key="@(context.Request.Headers.GetValueOrDefault("X-CorrelationId","anonymous"))" />
+        -->
+        
+        <!-- ────────────────────────────────────────────────────────────────────────────────────── -->
+        <!-- 2. EXTRACT & VALIDATE CORRELATION CONTEXT                                              -->
+        <!-- ────────────────────────────────────────────────────────────────────────────────────── -->
+        <set-variable name="correlationId" 
+                      value="@(context.Request.Headers.GetValueOrDefault("X-CorrelationId",""))" />
+        <set-variable name="correlationGuid" 
+                      value="@(context.Request.Headers.GetValueOrDefault("X-CorrelationGuid",""))" />
+        
+        <!-- Validate that correlation headers are present -->
+        <choose>
+            <when condition="@(string.IsNullOrEmpty((string)context.Variables["correlationId"]))">
+                <return-response>
+                    <set-status code="400" reason="Bad Request" />
+                    <set-header name="Content-Type" exists-action="override">
+                        <value>application/json</value>
+                    </set-header>
+                    <set-body>@{
+                        return new JObject(
+                            new JProperty("error", "Missing required header: X-CorrelationId")
+                        ).ToString();
+                    }</set-body>
+                </return-response>
+            </when>
+        </choose>
+        
+        <!-- ────────────────────────────────────────────────────────────────────────────────────── -->
+        <!-- 3. RETRIEVE API KEY FROM KEY VAULT                                                     -->
+        <!-- ────────────────────────────────────────────────────────────────────────────────────── -->
+        <!-- Use Managed Identity to access Key Vault -->
+        <authentication-managed-identity resource="https://vault.azure.net" />
+        
+        <!-- Get secret from Key Vault -->
+        <send-request mode="new" response-variable-name="keyvaultresponse" timeout="10" ignore-error="false">
+            <set-url>https://kv-shipment-integration.vault.azure.net/secrets/ThirdPartyApiKey?api-version=7.4</set-url>
+            <set-method>GET</set-method>
+            <authentication-managed-identity resource="https://vault.azure.net" />
+        </send-request>
+        
+        <!-- Extract API key from Key Vault response -->
+        <set-variable name="apiKey" 
+                      value="@(((IResponse)context.Variables["keyvaultresponse"]).Body.As<JObject>()["value"].ToString())" />
+        
+        <!-- ────────────────────────────────────────────────────────────────────────────────────── -->
+        <!-- 4. INJECT API KEY INTO REQUEST                                                         -->
+        <!-- ────────────────────────��───────────────────────────────────────────────────────────── -->
+        <set-header name="X-API-Key" exists-action="override">
+            <value>@((string)context.Variables["apiKey"])</value>
+        </set-header>
+        
+        <!-- Remove internal headers (don't forward to 3rd party) -->
+        <set-header name="X-CorrelationId" exists-action="delete" />
+        <set-header name="X-CorrelationGuid" exists-action="delete" />
+        
+        <!-- ────────────────────────────────────────────────────────────────────────────────────── -->
+        <!-- 5. LOG REQUEST TO APPLICATION INSIGHTS                                                 -->
+        <!-- ────────────────────────────────────────────────────────────────────────────────────── -->
+        <trace source="apim-outbound-request" severity="information">
+            <message>@($"Forwarding shipment to 3rd party: CorrelationId={context.Variables["correlationId"]}, CorrelationGuid={context.Variables["correlationGuid"]}")</message>
+            <metadata name="CorrelationId" value="@((string)context.Variables["correlationId"])" />
+            <metadata name="CorrelationGuid" value="@((string)context.Variables["correlationGuid"])" />
+            <metadata name="Direction" value="Outbound" />
+            <metadata name="TargetUrl" value="@(context.Request.Url.ToString())" />
+            <metadata name="Method" value="@(context.Request.Method)" />
+        </trace>
+        
+        <!-- ────────────────────────────────────────────────────────────────────────────────────── -->
+        <!-- 6. CIRCUIT BREAKER (Prevent cascading failures)                                        -->
+        <!-- ────────────────────────────────────────────────────────────────────────────────────── -->
+        <!-- If 3rd party has failed 5 times in last 60 seconds, return 503 immediately -->
+        <cache-lookup-value key="thirdparty-circuit-breaker" variable-name="circuitBreakerState" />
+        <choose>
+            <when condition="@(context.Variables.ContainsKey("circuitBreakerState") && 
+                               (int)context.Variables["circuitBreakerState"] >= 5)">
+                <return-response>
+                    <set-status code="503" reason="Service Unavailable" />
+                    <set-header name="Content-Type" exists-action="override">
+                        <value>application/json</value>
+                    </set-header>
+                    <set-header name="Retry-After" exists-action="override">
+                        <value>60</value>
+                    </set-header>
+                    <set-body>@{
+                        return new JObject(
+                            new JProperty("error", "Circuit breaker open - 3rd party service temporarily unavailable"),
+                            new JProperty("correlationId", context.Variables["correlationId"]),
+                            new JProperty("retryAfter", 60)
+                        ).ToString();
+                    }</set-body>
+                </return-response>
+            </when>
+        </choose>
+        
+        <!-- ────────────────────────────────────────────────────────────────────────────────────── -->
+        <!-- 7. SET BACKEND TIMEOUT                                                                 -->
+        <!-- ────────────────────────────────────────────────────────────────────────────────────── -->
+        <set-backend-service backend-id="thirdparty-logistics-backend" />
+        <timeout>30</timeout> <!-- 30 seconds -->
+        
+    </inbound>
+    
+    
+    <!-- ═══════════════════════════════════════════════════════════════════════════════════════════ -->
+    <!-- BACKEND POLICIES (Forwarding to backend)                                                   -->
+    <!-- ═══════════════════════════════════════════════════════════════════════════════════════════ -->
+    <backend>
+        <base />
+        
+        <!-- ────────────────────────────────────────────────────────────────────────────────────── -->
+        <!-- RETRY POLICY                                                                           -->
+        <!-- ────────────────────────────────────────────────────────────────────────────────────── -->
+        <retry condition="@(context.Response.StatusCode >= 500 || context.Response.StatusCode == 429)" 
+               count="3" 
+               interval="2" 
+               delta="1" 
+               max-interval="10">
+            
+            <forward-request timeout="30" />
+            
+            <!-- Log retry attempt -->
+            <choose>
+                <when condition="@(context.Response.StatusCode >= 500 || context.Response.StatusCode == 429)">
+                    <trace source="apim-retry" severity="warning">
+                        <message>@($"Retry attempt for CorrelationId={context.Variables["correlationId"]}, StatusCode={context.Response.StatusCode}")</message>
+                        <metadata name="CorrelationId" value="@((string)context.Variables["correlationId"])" />
+                        <metadata name="StatusCode" value="@(context.Response.StatusCode.ToString())" />
+                        <metadata name="RetryCount" value="@(context.Variables.GetValueOrDefault("retryCount", 0))" />
+                    </trace>
+                </when>
+            </choose>
+            
+        </retry>
+    </backend>
+    
+    
+    <!-- ═══════════════════════════════════════════════════════════════════════════════════════════ -->
+    <!-- OUTBOUND POLICIES (After receiving response from backend)                                  -->
+    <!-- ═══════════════════════════════════════════════════════════════════════════════════════════ -->
+    <outbound>
+        <base />
+        
+        <!-- ────────────────────────────────────────────────────────────────────────────────────── -->
+        <!-- 1. LOG RESPONSE TO APPLICATION INSIGHTS                                                -->
+        <!-- ────────────────────────────────────────────────────────────────────────────────────── -->
+        <trace source="apim-outbound-response" severity="information">
+            <message>@($"Received response from 3rd party: CorrelationId={context.Variables["correlationId"]}, StatusCode={context.Response.StatusCode}")</message>
+            <metadata name="CorrelationId" value="@((string)context.Variables["correlationId"])" />
+            <metadata name="CorrelationGuid" value="@((string)context.Variables["correlationGuid"])" />
+            <metadata name="StatusCode" value="@(context.Response.StatusCode.ToString())" />
+            <metadata name="Duration" value="@(context.Elapsed.TotalMilliseconds.ToString())" />
+            <metadata name="Direction" value="Outbound" />
+        </trace>
+        
+        <!-- ────────────────────────────────────────────────────────────────────────────────────── -->
+        <!-- 2. ADD CORRELATION HEADERS BACK TO RESPONSE                                            -->
+        <!-- ────────────────────────────────────────────────────────────────────────────────────── -->
+        <!-- So Logic App can track the response -->
+        <set-header name="X-CorrelationId" exists-action="override">
+            <value>@((string)context.Variables["correlationId"])</value>
+        </set-header>
+        <set-header name="X-CorrelationGuid" exists-action="override">
+            <value>@((string)context.Variables["correlationGuid"])</value>
+        </set-header>
+        
+        <!-- ────────────────────────────────────────────────────────────────────────────────────── -->
+        <!-- 3. HANDLE SUCCESS (Update circuit breaker)                                             -->
+        <!-- ────────────────────────────────────────────────────────────────────────────────────── -->
+        <choose>
+            <when condition="@(context.Response.StatusCode >= 200 && context.Response.StatusCode < 300)">
+                <!-- Reset circuit breaker on success -->
+                <cache-store-value key="thirdparty-circuit-breaker" value="0" duration="60" />
+            </when>
+        </choose>
+        
+        <!-- ────────────────────────────────────────────────────────────────────────────────────── -->
+        <!-- 4. MASK SENSITIVE DATA IN RESPONSE (Optional)                                          -->
+        <!-- ────────────────────────────────────────────────────────────────────────────────────── -->
+        <!-- Remove any sensitive fields from 3rd party response before returning -->
+        <choose>
+            <when condition="@(context.Response.Headers.GetValueOrDefault("Content-Type","").Contains("application/json"))">
+                <!-- Example: Mask API key if returned -->
+                <set-body>@{
+                    var body = context.Response.Body.As<JObject>();
+                    if (body["apiKey"] != null)
+                    {
+                        body["apiKey"] = "***MASKED***";
+                    }
+                    return body.ToString();
+                }</set-body>
+            </when>
+        </choose>
+        
+    </outbound>
+    
+    
+    <!-- ═══════════════════════════════════════════════════════════════════════════════════════════ -->
+    <!-- ON-ERROR POLICIES (When errors occur)                                                      -->
+    <!-- ═══════════════════════════════════════════════════════════════════════════════════════════ -->
+    <on-error>
+        <base />
+        
+        <!-- ────────────────────────────────────────────────────────────────────────────────────── -->
+        <!-- 1. INCREMENT CIRCUIT BREAKER COUNTER                                                   -->
+        <!-- ────────────────────────────────────────────────────────────────────────────────────── -->
+        <cache-lookup-value key="thirdparty-circuit-breaker" variable-name="circuitBreakerState" />
+        <set-variable name="newCircuitBreakerState" 
+                      value="@((context.Variables.ContainsKey("circuitBreakerState") 
+                               ? (int)context.Variables["circuitBreakerState"] 
+                               : 0) + 1)" />
+        <cache-store-value key="thirdparty-circuit-breaker" 
+                          value="@((int)context.Variables["newCircuitBreakerState"])" 
+                          duration="60" />
+        
+        <!-- ────────────────────────────────────────────────────────────────────────────────────── -->
+        <!-- 2. LOG ERROR TO APPLICATION INSIGHTS                                                   -->
+        <!-- ────────────────────────────────────────────────────────────────────────────────────── -->
+        <trace source="apim-error" severity="error">
+            <message>@($"Error calling 3rd party API: CorrelationId={context.Variables["correlationId"]}, Error={context.LastError.Message}")</message>
+            <metadata name="CorrelationId" value="@((string)context.Variables["correlationId"])" />
+            <metadata name="CorrelationGuid" value="@((string)context.Variables["correlationGuid"])" />
+            <metadata name="ErrorMessage" value="@(context.LastError.Message)" />
+            <metadata name="ErrorSource" value="@(context.LastError.Source)" />
+            <metadata name="CircuitBreakerState" value="@(((int)context.Variables["newCircuitBreakerState"]).ToString())" />
+        </trace>
+        
+        <!-- ────────────────────────────────────────────────────────────────────────────────────── -->
+        <!-- 3. RETURN STANDARDIZED ERROR RESPONSE                                                  -->
+        <!-- ────────────────────────────────────────────────────────────────────────────────────── -->
+        <return-response>
+            <set-status code="502" reason="Bad Gateway" />
+            <set-header name="Content-Type" exists-action="override">
+                <value>application/json</value>
+            </set-header>
+            <set-header name="X-CorrelationId" exists-action="override">
+                <value>@((string)context.Variables["correlationId"])</value>
+            </set-header>
+            <set-header name="X-CorrelationGuid" exists-action="override">
+                <value>@((string)context.Variables["correlationGuid"])</value>
+            </set-header>
+            <set-body>@{
+                return new JObject(
+                    new JProperty("error", "Failed to communicate with 3rd party logistics API"),
+                    new JProperty("correlationId", context.Variables["correlationId"]),
+                    new JProperty("correlationGuid", context.Variables["correlationGuid"]),
+                    new JProperty("message", context.LastError.Message),
+                    new JProperty("timestamp", DateTime.UtcNow.ToString("o")),
+                    new JProperty("willRetry", context.Response.StatusCode >= 500)
+                ).ToString();
+            }</set-body>
+        </return-response>
+        
+    </on-error>
+    
+</policies>
